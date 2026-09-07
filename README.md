@@ -198,6 +198,10 @@ When the tray icon is enabled, click it to switch between per-key typing and
 one-shot paste output, or to choose a microphone used only by whisrs. Tray
 changes take effect on the next recording and are saved to `config.toml`.
 Paste mode restores the previous clipboard text after inserting a transcript.
+The waveform HUD clears when the paste is sent, without waiting for clipboard
+restoration. To discard an active recording or pending transcription, use
+**Cancel current transcription** in its own section of the tray dropdown.
+It is disabled when idle; the HUD has no cancel button.
 
 ---
 
@@ -208,7 +212,7 @@ whisrs setup     # Interactive onboarding
 whisrs config    # Interactive editor for ~/.config/whisrs/config.toml
 whisrs toggle    # Start/stop recording (uses general.language)
 whisrs toggle -l en  # Start/stop recording, overriding the language for this session
-whisrs cancel    # Cancel recording, discard audio
+whisrs cancel    # Cancel recording or pending transcription
 whisrs status    # Query daemon state
 whisrs restart   # Restart the daemon (uses the systemd user service when present)
 whisrs command   # Command mode: select text + speak instruction → LLM rewrite

@@ -55,7 +55,7 @@ enum SubCmd {
         #[arg(short, long, value_parser = whisrs::validate_language_override)]
         language: Option<String>,
     },
-    /// Cancel the current recording and discard audio
+    /// Cancel recording or pending transcription, or stop read-aloud
     Cancel,
     /// Query the daemon state (idle, recording, transcribing)
     Status,

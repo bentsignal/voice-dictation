@@ -58,8 +58,9 @@ dictate in each without switching settings.
 .RE
 .TP
 .B cancel
-Cancel the current recording and discard captured audio. Returns the
-daemon to the idle state. Has no effect if the daemon is not recording.
+Cancel the current recording or pending transcription and discard pending
+output. Also stops read-aloud synthesis or playback. Returns the daemon
+to the idle state. Text already delivered is not removed.
 .TP
 .B speak
 Read the current text selection aloud via text-to-speech. A second

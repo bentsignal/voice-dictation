@@ -56,7 +56,7 @@ impl StateMachine {
     /// Valid transitions:
     /// - Toggle:            Idle → Recording
     /// - Toggle:            Recording → Transcribing
-    /// - Cancel:            Recording → Idle
+    /// - Cancel:            Recording / Transcribing → Idle
     /// - TranscriptionDone: Transcribing → Idle
     /// - SpeakStart:        Idle → Synthesizing
     /// - SpeakPlaying:      Synthesizing → Speaking
@@ -71,7 +71,7 @@ impl StateMachine {
         let new_state = match (self.state, action) {
             (State::Idle, Action::Toggle) => State::Recording,
             (State::Recording, Action::Toggle) => State::Transcribing,
-            (State::Recording, Action::Cancel) => State::Idle,
+            (State::Recording | State::Transcribing, Action::Cancel) => State::Idle,
             (State::Transcribing, Action::TranscriptionDone) => State::Idle,
             // Read-aloud flow.
             (State::Idle, Action::SpeakStart) => State::Synthesizing,
@@ -170,18 +170,12 @@ mod tests {
     }
 
     #[test]
-    fn invalid_cancel_while_transcribing() {
+    fn cancel_while_transcribing() {
         let mut sm = StateMachine::new();
-        sm.transition(Action::Toggle).unwrap(); // → Recording
-        sm.transition(Action::Toggle).unwrap(); // → Transcribing
-        let err = sm.transition(Action::Cancel).unwrap_err();
-        assert!(matches!(
-            err,
-            WhisrsError::InvalidTransition {
-                from: State::Transcribing,
-                ..
-            }
-        ));
+        sm.transition(Action::Toggle).unwrap();
+        sm.transition(Action::Toggle).unwrap();
+        assert_eq!(sm.transition(Action::Cancel).unwrap(), State::Idle);
+        assert_eq!(sm.transition(Action::Toggle).unwrap(), State::Recording);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! Desktop overlay shown while recording or transcribing.
 
+use std::os::fd::AsRawFd;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -7,6 +8,10 @@ use std::time::{Duration, Instant};
 enum OverlayError {
     #[error("Wayland connection error: {0}")]
     Connect(#[from] wayland_client::ConnectError),
+    #[error("Wayland I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("Wayland backend error: {0}")]
+    Backend(#[from] wayland_client::backend::WaylandError),
     #[error("Wayland globals error: {0}")]
     Globals(#[from] wayland_client::globals::GlobalError),
     #[error("smithay bind error: {0}")]
@@ -225,8 +230,8 @@ impl Theme {
 /// blocking client loops. A small Tokio task forwards daemon state changes into
 /// that thread.
 pub async fn spawn_overlay(
-    mut state_rx: watch::Receiver<State>,
-    mut level_rx: watch::Receiver<f32>,
+    state_rx: watch::Receiver<State>,
+    level_rx: watch::Receiver<f32>,
     config: OverlayConfig,
 ) {
     if is_gnome_desktop() {
@@ -241,10 +246,26 @@ pub async fn spawn_overlay(
         });
     }
 
+    loop {
+        run_overlay_session(state_rx.clone(), level_rx.clone(), config.clone()).await;
+        if state_rx.has_changed().is_err() {
+            break;
+        }
+        warn!("overlay connection or layer closed; recreating overlay in one second");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+async fn run_overlay_session(
+    mut state_rx: watch::Receiver<State>,
+    mut level_rx: watch::Receiver<f32>,
+    config: OverlayConfig,
+) {
     let (tx, rx) = mpsc::channel::<State>();
     let (level_tx, level_rx_thread) = mpsc::channel::<f32>();
     let (focused_output_tx, focused_output_rx) = mpsc::channel::<String>();
-    spawn_hyprland_focused_output_watcher(state_rx.clone(), focused_output_tx);
+    let watcher = spawn_hyprland_focused_output_watcher(state_rx.clone(), focused_output_tx);
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
 
     let backend = OverlayBackend::detect();
     info!("overlay backend selected: {backend:?}");
@@ -252,6 +273,8 @@ pub async fn spawn_overlay(
     std::thread::Builder::new()
         .name("whisrs-overlay".to_string())
         .spawn(move || {
+            // Dropping the sender also wakes the supervisor on an early return.
+            let _done = done_tx;
             let result = match backend {
                 OverlayBackend::Wayland => {
                     run_overlay(rx, level_rx_thread, focused_output_rx, overlay_config)
@@ -269,7 +292,7 @@ pub async fn spawn_overlay(
         .map_err(|e| warn!("failed to spawn overlay thread: {e}"))
         .ok();
 
-    tokio::spawn(async move {
+    let forwarding = tokio::spawn(async move {
         let _ = tx.send(*state_rx.borrow());
         let _ = level_tx.send(*level_rx.borrow());
         loop {
@@ -285,17 +308,22 @@ pub async fn spawn_overlay(
             }
         }
     });
+    let _ = done_rx.await;
+    forwarding.abort();
+    if let Some(watcher) = watcher {
+        watcher.abort();
+    }
 }
 
 fn spawn_hyprland_focused_output_watcher(
     mut state_rx: watch::Receiver<State>,
     focused_output_tx: mpsc::Sender<String>,
-) {
+) -> Option<tokio::task::JoinHandle<()>> {
     if !env_var_is_set("HYPRLAND_INSTANCE_SIGNATURE") {
-        return;
+        return None;
     }
 
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(200));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut active = *state_rx.borrow() != State::Idle;
@@ -328,7 +356,7 @@ fn spawn_hyprland_focused_output_watcher(
                 break;
             }
         }
-    });
+    }))
 }
 
 async fn query_hyprland_focused_output() -> Option<String> {
@@ -555,16 +583,70 @@ fn run_overlay(
     };
 
     info!("recording overlay started");
+    let mut next_frame = Instant::now();
+    let mut needs_clear = true;
     while !overlay.exit {
         overlay.renderer.apply_state_updates();
         overlay.apply_focused_output(&qh);
         if overlay.renderer.disconnected {
             break;
         }
-        event_queue.blocking_dispatch(&mut overlay)?;
+        // Invisible/occluded surfaces may never receive frame callbacks.
+        // Poll with a deadline so recording state and audio always wake the HUD.
+        event_queue.dispatch_pending(&mut overlay)?;
+        if overlay.exit {
+            break;
+        }
+        let now = Instant::now();
+        if now >= next_frame {
+            if !overlay.first_configure
+                && (overlay.renderer.target_state != State::Idle || needs_clear)
+            {
+                overlay.draw(&qh);
+                needs_clear = overlay.renderer.target_state != State::Idle;
+            }
+            next_frame = now + Duration::from_millis(FRAME_MS);
+        }
+        tolerate_would_block(conn.flush())?;
+        if let Some(guard) = event_queue.prepare_read() {
+            let mut fd = libc::pollfd {
+                fd: guard.connection_fd().as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: fd points to one initialized pollfd for this call.
+            let timeout = next_frame
+                .saturating_duration_since(Instant::now())
+                .as_millis()
+                .max(1) as i32;
+            let ready = unsafe { libc::poll(&mut fd, 1, timeout) };
+            if ready > 0 {
+                tolerate_would_block(guard.read())?;
+            } else if ready < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(error.into());
+                }
+            }
+        }
     }
 
     Ok(())
+}
+
+// Read readiness can be spurious; Wayland uses a nonblocking socket.
+fn tolerate_would_block<T>(
+    result: Result<T, wayland_client::backend::WaylandError>,
+) -> Result<(), OverlayError> {
+    match result {
+        Ok(_) => Ok(()),
+        Err(wayland_client::backend::WaylandError::Io(error))
+            if error.kind() == std::io::ErrorKind::WouldBlock =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn create_overlay_layer(
@@ -1224,9 +1306,9 @@ impl OverlayRenderer {
                     let now_idle = state == State::Idle;
                     self.target_state = state;
 
-                    if !now_idle {
-                        self.visible_state = state;
-                    }
+                    // Completion must clear on the next frame, without a
+                    // trailing disappearance animation after text is pasted.
+                    self.visible_state = state;
 
                     // Trigger spawn / despawn only on the boundary between
                     // idle and visible. Recording ↔ Transcribing keeps the
@@ -1414,7 +1496,7 @@ impl Overlay {
         info!("recording overlay moved to output {desired_name}");
     }
 
-    fn draw(&mut self, qh: &QueueHandle<Self>) {
+    fn draw(&mut self, _qh: &QueueHandle<Self>) {
         let width = self.renderer.width;
         let height = self.renderer.height;
         let stride = width as i32 * 4;
@@ -1435,16 +1517,11 @@ impl Overlay {
         self.layer
             .wl_surface()
             .damage_buffer(0, 0, width as i32, height as i32);
-        self.layer
-            .wl_surface()
-            .frame(qh, self.layer.wl_surface().clone());
         if let Err(e) = buffer.attach_to(self.layer.wl_surface()) {
             warn!("failed to attach overlay buffer: {e}");
             return;
         }
         self.layer.commit();
-
-        std::thread::sleep(Duration::from_millis(FRAME_MS));
     }
 }
 
@@ -1557,7 +1634,8 @@ impl CompositorHandler for Overlay {
         if surface != self.layer.wl_surface() {
             return;
         }
-        self.draw(qh);
+        // Rendering is driven by the bounded event loop.
+        let _ = qh;
     }
 
     fn surface_enter(
@@ -2053,6 +2131,41 @@ mod tests {
             bar_alpha: 0.0,
             bars_locked: true,
         }
+    }
+
+    #[test]
+    fn nonblocking_wayland_reads_only_retry_would_block() {
+        use wayland_client::backend::WaylandError;
+        assert!(tolerate_would_block::<()>(Err(WaylandError::Io(
+            std::io::ErrorKind::WouldBlock.into()
+        )))
+        .is_ok());
+        assert!(tolerate_would_block::<()>(Err(WaylandError::Io(
+            std::io::ErrorKind::BrokenPipe.into()
+        )))
+        .is_err());
+    }
+
+    #[test]
+    fn completion_clears_visible_overlay_on_next_frame() {
+        let (state_tx, state_rx) = mpsc::channel();
+        let (_level_tx, level_rx) = mpsc::channel();
+        let mut renderer =
+            OverlayRenderer::new(state_rx, level_rx, W, H, Theme::ember(), 1.0).unwrap();
+        state_tx.send(State::Recording).unwrap();
+        renderer.apply_state_updates();
+        renderer.spawn_started = Instant::now() - Duration::from_secs(1);
+        renderer.draw_frame();
+        assert!(renderer.pixmap.data().chunks_exact(4).any(|px| px[3] != 0));
+        state_tx.send(State::Transcribing).unwrap();
+        renderer.draw_frame();
+        state_tx.send(State::Idle).unwrap();
+        renderer.draw_frame();
+        assert!(renderer.pixmap.data().iter().all(|byte| *byte == 0));
+        state_tx.send(State::Recording).unwrap();
+        renderer.apply_state_updates();
+        assert_eq!(renderer.visible_state, State::Recording);
+        assert!(renderer.spawn_in);
     }
 
     #[test]

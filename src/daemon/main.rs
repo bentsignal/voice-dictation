@@ -62,6 +62,10 @@ struct DaemonState {
     /// phrase). Setting this flag makes the typing loop discard everything
     /// instead, so `cancel` never types text. Created per recording.
     streaming_cancel: Option<Arc<AtomicBool>>,
+    /// Cancels the stop-toggle future while preserving the IPC response.
+    transcription_abort: Option<futures_util::future::AbortHandle>,
+    /// Retained even after the streaming JoinHandle moves to the stop-toggle.
+    pipeline_abort: Option<tokio::task::AbortHandle>,
     /// When recording started (for duration tracking).
     recording_started_at: Option<std::time::Instant>,
     /// The language for the active dictation session, resolved at the
@@ -92,6 +96,8 @@ impl DaemonState {
             recording_window_id: None,
             streaming_task: None,
             streaming_cancel: None,
+            transcription_abort: None,
+            pipeline_abort: None,
             recording_started_at: None,
             session_language: None,
             session_output_mode: OutputMode::Type,
@@ -128,6 +134,7 @@ struct DaemonContext {
     /// overlay already shows recording/transcribing state visually.
     /// Error notifications still fire.
     overlay_enabled: bool,
+    overlay_state_tx: tokio::sync::watch::Sender<State>,
 }
 
 impl DaemonContext {
@@ -746,6 +753,19 @@ async fn main() -> Result<()> {
 
     // State broadcast channel — consumed by system tray and overlay.
     let (state_tx, state_rx) = tokio::sync::watch::channel(State::Idle);
+    let (overlay_state_tx, overlay_state_rx) = tokio::sync::watch::channel(State::Idle);
+    let mut overlay_source = state_rx.clone();
+    let overlay_target = overlay_state_tx.clone();
+    tokio::spawn(async move {
+        let mut previous = State::Idle;
+        while overlay_source.changed().await.is_ok() {
+            let state = *overlay_source.borrow_and_update();
+            if state != previous {
+                let _ = overlay_target.send(state);
+                previous = state;
+            }
+        }
+    });
     let (overlay_level_tx, overlay_level_rx) = tokio::sync::watch::channel(0.0_f32);
 
     let tray_enabled = config.general.tray;
@@ -765,6 +785,7 @@ async fn main() -> Result<()> {
         state_tx,
         overlay_level_tx: overlay_enabled.then_some(overlay_level_tx),
         overlay_enabled,
+        overlay_state_tx,
     });
 
     // Start system tray if enabled.
@@ -781,7 +802,7 @@ async fn main() -> Result<()> {
     // Spawned as a background task so desktop integration failures do not stop the daemon.
     if overlay_enabled {
         tokio::spawn(whisrs::overlay::spawn_overlay(
-            state_rx,
+            overlay_state_rx,
             overlay_level_rx,
             overlay_config,
         ));
@@ -1075,6 +1096,11 @@ async fn handle_toggle(
                 }
             };
 
+            // Retire handles from an auto-completed session before starting another.
+            ds.streaming_cancel = None;
+            ds.pipeline_abort = None;
+            ds.transcription_abort = None;
+
             // For streaming backends: start the streaming pipeline immediately.
             // Audio flows in real-time from microphone → API → text at cursor.
             if context.transcription_backend.supports_streaming() {
@@ -1111,6 +1137,7 @@ async fn handle_toggle(
                 let pipeline_backend_name = context.config.general.backend.clone();
                 let pipeline_language = session_language.clone();
                 let pipeline_state_tx = context.state_tx.clone();
+                let pipeline_overlay_tx = context.overlay_state_tx.clone();
                 let pipeline_key_delay =
                     std::time::Duration::from_millis(context.config.input.key_delay_ms);
                 let pipeline_injector_backend = context.config.input.backend;
@@ -1139,6 +1166,7 @@ async fn handle_toggle(
                         pipeline_backend_name,
                         pipeline_language,
                         pipeline_state_tx,
+                        pipeline_overlay_tx,
                         pipeline_key_delay,
                         pipeline_injector_backend,
                         output_mode,
@@ -1148,6 +1176,7 @@ async fn handle_toggle(
                     .await
                 });
 
+                ds.pipeline_abort = Some(task.abort_handle());
                 ds.streaming_task = Some(task);
                 ds.streaming_cancel = Some(cancel_flag);
 
@@ -1213,9 +1242,13 @@ async fn handle_toggle(
                     let capture = ds.audio_capture.take();
                     let window_id = ds.recording_window_id.take();
                     let streaming_task = ds.streaming_task.take();
-                    // Normal stop: drop the cancel flag untriggered so the
-                    // pipeline drains and types the remaining text.
-                    ds.streaming_cancel = None;
+                    // Keep cancellation available while the backend finishes.
+                    let (abort, registration) = futures_util::future::AbortHandle::new_pair();
+                    ds.transcription_abort = Some(abort.clone());
+                    let cancel_flag = ds
+                        .streaming_cancel
+                        .get_or_insert_with(|| Arc::new(AtomicBool::new(false)))
+                        .clone();
                     let recording_started_at = ds.recording_started_at.take();
                     let output_mode = ds.session_output_mode;
                     let is_terminal = ds.recording_is_terminal;
@@ -1241,30 +1274,41 @@ async fn handle_toggle(
                     // Release lock before slow operations.
                     drop(ds);
 
-                    let result = if let Some(task) = streaming_task {
-                        // Streaming path: stop capture to close the channel,
-                        // then wait for the pipeline to drain and finish.
-                        if let Some(mut cap) = capture {
-                            cap.stop();
-                            tokio::task::spawn_blocking(move || drop(cap));
-                        }
-                        match task.await {
-                            Ok(Ok(text)) => Ok(text),
-                            Ok(Err(e)) => Err(e),
-                            Err(e) => Err(anyhow::anyhow!("streaming task panicked: {e}")),
-                        }
-                    } else {
-                        // Batch path: collect all audio, then transcribe with
-                        // the session language (not the config default).
-                        process_recording_batch(
-                            capture,
-                            window_id.as_deref(),
-                            &context,
-                            &session_language,
-                            output_mode,
-                            is_terminal,
-                        )
-                        .await
+                    let result = futures_util::future::Abortable::new(
+                        async {
+                            if let Some(task) = streaming_task {
+                                // Streaming path: stop capture to close the channel,
+                                // then wait for the pipeline to drain and finish.
+                                if let Some(mut cap) = capture {
+                                    cap.stop();
+                                    tokio::task::spawn_blocking(move || drop(cap));
+                                }
+                                match task.await {
+                                    Ok(Ok(text)) => Ok(text),
+                                    Ok(Err(e)) => Err(e),
+                                    Err(e) => Err(anyhow::anyhow!("streaming task panicked: {e}")),
+                                }
+                            } else {
+                                // Batch path: collect all audio, then transcribe with
+                                // the session language (not the config default).
+                                process_recording_batch(
+                                    capture,
+                                    window_id.as_deref(),
+                                    &context,
+                                    &session_language,
+                                    output_mode,
+                                    is_terminal,
+                                    Arc::clone(&cancel_flag),
+                                )
+                                .await
+                            }
+                        },
+                        registration,
+                    )
+                    .await;
+                    let result = match result {
+                        Ok(result) => result,
+                        Err(_) => return Response::Ok { state: State::Idle },
                     };
 
                     // Transition back to Idle.
@@ -1272,6 +1316,19 @@ async fn handle_toggle(
                         .map(|t| t.elapsed().as_secs_f64())
                         .unwrap_or(0.0);
                     let mut ds = daemon_state.lock().await;
+                    if abort.is_aborted()
+                        || !ds
+                            .streaming_cancel
+                            .as_ref()
+                            .is_some_and(|active| Arc::ptr_eq(active, &cancel_flag))
+                    {
+                        return Response::Ok {
+                            state: ds.state_machine.state(),
+                        };
+                    }
+                    ds.transcription_abort = None;
+                    ds.pipeline_abort = None;
+                    ds.streaming_cancel = None;
                     match ds.state_machine.transition(Action::TranscriptionDone) {
                         Ok(new_state) => {
                             // Broadcast idle state for tray.
@@ -1383,6 +1440,7 @@ async fn run_streaming_pipeline(
     backend_name: String,
     language: String,
     state_tx: tokio::sync::watch::Sender<State>,
+    overlay_state_tx: tokio::sync::watch::Sender<State>,
     key_delay: std::time::Duration,
     injector_backend: InjectorBackend,
     output_mode: OutputMode,
@@ -1570,8 +1628,16 @@ async fn run_streaming_pipeline(
             }
         }
         let text_to_paste = full_text.clone();
+        let paste_cancel = Arc::clone(&cancel_flag);
         match tokio::task::spawn_blocking(move || {
-            paste_text_at_cursor(&text_to_paste, key_delay, injector_backend, is_terminal)
+            paste_text_at_cursor(
+                &text_to_paste,
+                key_delay,
+                injector_backend,
+                is_terminal,
+                &overlay_state_tx,
+                &paste_cancel,
+            )
         })
         .await
         {
@@ -1596,6 +1662,10 @@ async fn run_streaming_pipeline(
         }
     }
 
+    if cancel_flag.load(Ordering::SeqCst) {
+        return Ok(String::new());
+    }
+
     // Save to history if we got any text.
     if !full_text.is_empty() {
         let duration_secs = pipeline_start.elapsed().as_secs_f64();
@@ -1604,6 +1674,9 @@ async fn run_streaming_pipeline(
 
     // If auto-stop happened, we need to transition to Idle.
     let mut ds = daemon_state.lock().await;
+    if cancel_flag.load(Ordering::SeqCst) {
+        return Ok(String::new());
+    }
     if ds.state_machine.state() == State::Transcribing {
         debug!("streaming pipeline transitioning daemon state back to idle");
         ds.state_machine.transition(Action::TranscriptionDone).ok();
@@ -1722,6 +1795,7 @@ async fn process_recording_batch(
     language: &str,
     output_mode: OutputMode,
     is_terminal: bool,
+    cancel_flag: Arc<AtomicBool>,
 ) -> Result<String> {
     use whisrs::audio::capture::encode_wav;
 
@@ -1857,10 +1931,21 @@ async fn process_recording_batch(
     let text_clone = text.clone();
     let key_delay = std::time::Duration::from_millis(context.config.input.key_delay_ms);
     let injector_backend = context.config.input.backend;
-    match tokio::task::spawn_blocking(move || match output_mode {
-        OutputMode::Type => type_text_at_cursor(&text_clone, key_delay, injector_backend),
-        OutputMode::Paste => {
-            paste_text_at_cursor(&text_clone, key_delay, injector_backend, is_terminal)
+    let overlay_state_tx = context.overlay_state_tx.clone();
+    match tokio::task::spawn_blocking(move || {
+        if cancel_flag.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        match output_mode {
+            OutputMode::Type => type_text_at_cursor(&text_clone, key_delay, injector_backend),
+            OutputMode::Paste => paste_text_at_cursor(
+                &text_clone,
+                key_delay,
+                injector_backend,
+                is_terminal,
+                &overlay_state_tx,
+                &cancel_flag,
+            ),
         }
     })
     .await
@@ -1958,6 +2043,8 @@ fn paste_text_at_cursor(
     key_delay: std::time::Duration,
     backend: InjectorBackend,
     is_terminal: bool,
+    overlay_state_tx: &tokio::sync::watch::Sender<State>,
+    cancel_flag: &AtomicBool,
 ) -> Result<()> {
     let clipboard = xkb_type::default_clipboard();
     paste_with_clipboard_restore(
@@ -1987,6 +2074,11 @@ fn paste_text_at_cursor(
             } else {
                 &[evdev::Key::KEY_LEFTCTRL, evdev::Key::KEY_V]
             };
+            if cancel_flag.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            // Hide at delivery, before the clipboard restoration grace period.
+            let _ = overlay_state_tx.send(State::Idle);
             let result = keyboard
                 .send_combo(keys)
                 .context("failed to inject transcription paste shortcut");
@@ -2368,9 +2460,11 @@ async fn command_mode_start(
     // Spawn background task: collect audio (with auto-stop), then process.
     let ds_ref = Arc::clone(&daemon_state);
     let ctx = Arc::clone(&context);
-    tokio::spawn(async move {
+    let mut ds = daemon_state.lock().await;
+    let task = tokio::spawn(async move {
         command_mode_background(audio_rx, ds_ref, ctx).await;
     });
+    ds.pipeline_abort = Some(task.abort_handle());
 
     Response::Ok {
         state: State::Recording,
@@ -3043,6 +3137,14 @@ async fn handle_cancel(
 
     match ds.state_machine.transition(Action::Cancel) {
         Ok(new_state) => {
+            if let Some(abort) = ds.transcription_abort.take() {
+                abort.abort();
+            }
+            if let Some(abort) = ds.pipeline_abort.take() {
+                abort.abort();
+            }
+            ds.command_mode = None;
+            let _ = context.state_tx.send(new_state);
             if let Some(mut capture) = ds.audio_capture.take() {
                 capture.stop();
                 tokio::task::spawn_blocking(move || drop(capture));
@@ -3086,6 +3188,64 @@ async fn handle_cancel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancel_transcription_aborts_work_and_publishes_idle() {
+        let config: Config =
+            toml::from_str("[general]\nbackend = \"asr-sidecar\"\n[audio]\ndevice = \"default\"")
+                .unwrap();
+        let (state_tx, state_rx) = tokio::sync::watch::channel(State::Transcribing);
+        let (overlay_state_tx, _) = tokio::sync::watch::channel(State::Transcribing);
+        let context = Arc::new(DaemonContext {
+            config,
+            preferences: Arc::new(RwLock::new(DictationPreferences {
+                output_mode: OutputMode::Paste,
+                audio_device: "default".into(),
+            })),
+            window_tracker: Arc::new(window::NoopTracker),
+            transcription_backend: Arc::new(
+                whisrs::transcription::asr_sidecar::AsrSidecarBackend::new(
+                    "http://127.0.0.1:1".into(),
+                ),
+            ),
+            notify: false,
+            state_tx,
+            overlay_level_tx: None,
+            overlay_enabled: true,
+            overlay_state_tx,
+        });
+        let mut ds = DaemonState::new();
+        ds.state_machine.transition(Action::Toggle).unwrap();
+        ds.state_machine.transition(Action::Toggle).unwrap();
+        let (abort, registration) = futures_util::future::AbortHandle::new_pair();
+        ds.transcription_abort = Some(abort);
+        let cancel = Arc::new(AtomicBool::new(false));
+        ds.streaming_cancel = Some(Arc::clone(&cancel));
+        let pipeline = tokio::spawn(std::future::pending::<()>());
+        ds.pipeline_abort = Some(pipeline.abort_handle());
+        let work = tokio::spawn(futures_util::future::Abortable::new(
+            std::future::pending::<()>(),
+            registration,
+        ));
+        let state = Arc::new(Mutex::new(ds));
+        assert!(matches!(
+            handle_cancel(Arc::clone(&state), context).await,
+            Response::Ok { state: State::Idle }
+        ));
+        assert_eq!(*state_rx.borrow(), State::Idle);
+        assert!(cancel.load(Ordering::SeqCst));
+        assert!(work.await.unwrap().is_err());
+        assert!(pipeline.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            state
+                .lock()
+                .await
+                .state_machine
+                .transition(Action::Toggle)
+                .unwrap(),
+            State::Recording
+        );
+    }
 
     #[test]
     fn resolve_language_prefers_override() {

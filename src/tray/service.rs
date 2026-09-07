@@ -231,6 +231,36 @@ impl ksni::Tray for WhisrsTray {
             .into(),
             ksni::MenuItem::Separator,
             StandardItem {
+                label: "Cancel current transcription".to_string(),
+                enabled: matches!(self.state.current, State::Recording | State::Transcribing),
+                activate: Box::new(|_| {
+                    tokio::spawn(async {
+                        use tokio::io::AsyncWriteExt;
+                        let result = async {
+                            let mut stream =
+                                tokio::net::UnixStream::connect(crate::socket_path()).await?;
+                            stream
+                                .write_all(&crate::encode_message(&crate::Command::Cancel)?)
+                                .await?;
+                            stream.shutdown().await?;
+                            let response: crate::Response =
+                                crate::read_message(&mut stream).await?;
+                            if let crate::Response::Error { message } = response {
+                                anyhow::bail!(message);
+                            }
+                            Ok::<_, anyhow::Error>(())
+                        }
+                        .await;
+                        if let Err(error) = result {
+                            warn!("could not cancel transcription: {error:#}");
+                        }
+                    });
+                }),
+                ..Default::default()
+            }
+            .into(),
+            ksni::MenuItem::Separator,
+            StandardItem {
                 label: "Copy last transcription".to_string(),
                 enabled: has_transcription,
                 icon_name: "edit-copy".to_string(),
@@ -452,6 +482,38 @@ pub async fn spawn_tray(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancellation_is_separate_and_only_enabled_during_dictation() {
+        use ksni::Tray;
+        for state in [
+            State::Idle,
+            State::Recording,
+            State::Transcribing,
+            State::Speaking,
+            State::Synthesizing,
+        ] {
+            let tray = WhisrsTray {
+                state: TrayState { current: state },
+                preferences: Arc::new(RwLock::new(DictationPreferences {
+                    output_mode: OutputMode::Paste,
+                    audio_device: "default".into(),
+                })),
+                audio_devices: vec![],
+            };
+            let menu = tray.menu();
+            let index = menu.iter().position(|item| matches!(item, ksni::MenuItem::Standard(item) if item.label == "Cancel current transcription")).unwrap();
+            let ksni::MenuItem::Standard(item) = &menu[index] else {
+                unreachable!()
+            };
+            assert_eq!(
+                item.enabled,
+                matches!(state, State::Recording | State::Transcribing)
+            );
+            assert!(matches!(menu[index - 1], ksni::MenuItem::Separator));
+            assert!(matches!(menu[index + 1], ksni::MenuItem::Separator));
+        }
+    }
 
     #[test]
     fn preference_update_preserves_unrelated_config_and_comments() {
