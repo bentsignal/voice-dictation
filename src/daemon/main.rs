@@ -49,6 +49,8 @@ struct CommandModeContext {
 struct DaemonState {
     state_machine: StateMachine,
     audio_capture: Option<AudioCaptureHandle>,
+    /// Background sidecar batches; final text is inserted only on stop.
+    chunked_task: Option<whisrs::transcription::chunked_batch::BatchTask>,
     /// The window that was focused when recording started.
     recording_window_id: Option<String>,
     /// Handle to the background streaming pipeline (if active).
@@ -93,6 +95,7 @@ impl DaemonState {
         Self {
             state_machine: StateMachine::new(),
             audio_capture: None,
+            chunked_task: None,
             recording_window_id: None,
             streaming_task: None,
             streaming_cancel: None,
@@ -1188,6 +1191,31 @@ async fn handle_toggle(
                 }
             }
 
+            if matches!(
+                context.config.general.backend.as_str(),
+                "asr-sidecar" | "asr" | "vibevoice"
+            ) {
+                let seconds = context
+                    .config
+                    .asr_sidecar
+                    .as_ref()
+                    .map_or(0, |c| c.chunk_seconds);
+                if seconds > 0 {
+                    let rx = capture
+                        .take_receiver()
+                        .expect("batch capture receiver available");
+                    let task = tokio::spawn(whisrs::transcription::chunked_batch::run(
+                        rx,
+                        Arc::clone(&context.transcription_backend),
+                        build_transcription_config(&context.config, &session_language),
+                        seconds,
+                    ));
+                    ds.pipeline_abort = Some(task.abort_handle());
+                    ds.chunked_task = Some(task);
+                    info!(seconds, "background batch transcription enabled");
+                }
+            }
+
             ds.audio_capture = Some(capture);
             ds.recording_window_id = window_id;
             ds.recording_started_at = Some(std::time::Instant::now());
@@ -1210,6 +1238,9 @@ async fn handle_toggle(
                 }
                 Err(e) => {
                     ds.audio_capture = None;
+                    if let Some(task) = ds.chunked_task.take() {
+                        task.abort();
+                    }
                     ds.recording_window_id = None;
                     ds.streaming_task = None;
                     ds.streaming_cancel = None;
@@ -1242,6 +1273,7 @@ async fn handle_toggle(
                     let capture = ds.audio_capture.take();
                     let window_id = ds.recording_window_id.take();
                     let streaming_task = ds.streaming_task.take();
+                    let chunked_task = ds.chunked_task.take();
                     // Keep cancellation available while the backend finishes.
                     let (abort, registration) = futures_util::future::AbortHandle::new_pair();
                     ds.transcription_abort = Some(abort.clone());
@@ -1289,10 +1321,11 @@ async fn handle_toggle(
                                     Err(e) => Err(anyhow::anyhow!("streaming task panicked: {e}")),
                                 }
                             } else {
-                                // Batch path: collect all audio, then transcribe with
-                                // the session language (not the config default).
+                                // Batch path: finish background work or decode once,
+                                // using the language selected at recording start.
                                 process_recording_batch(
                                     capture,
+                                    chunked_task,
                                     window_id.as_deref(),
                                     &context,
                                     &session_language,
@@ -1785,11 +1818,12 @@ where
     full_text
 }
 
-/// Batch mode: collect all audio, transcribe in one shot, type result.
+/// Batch mode: finish background batches (if enabled), otherwise decode once.
 /// `language` is the resolved session language (per-toggle override or
 /// config default) captured when recording started.
 async fn process_recording_batch(
     capture: Option<AudioCaptureHandle>,
+    chunked_task: Option<whisrs::transcription::chunked_batch::BatchTask>,
     window_id: Option<&str>,
     context: &DaemonContext,
     language: &str,
@@ -1799,9 +1833,19 @@ async fn process_recording_batch(
 ) -> Result<String> {
     use whisrs::audio::capture::encode_wav;
 
-    let samples = match capture {
-        Some(cap) => cap.stop_and_collect().await?,
-        None => anyhow::bail!("no audio capture to collect"),
+    let (samples, background_result) = if let Some(task) = chunked_task {
+        if let Some(mut cap) = capture {
+            cap.stop();
+            tokio::task::spawn_blocking(move || drop(cap));
+        }
+        let (samples, result) = task.await.context("background batch task failed")?;
+        (samples, Some(result))
+    } else {
+        let samples = match capture {
+            Some(cap) => cap.stop_and_collect().await?,
+            None => anyhow::bail!("no audio capture to collect"),
+        };
+        (samples, None)
     };
 
     if samples.is_empty() {
@@ -1834,16 +1878,18 @@ async fn process_recording_batch(
         return Ok(String::new());
     }
 
-    let wav_data = encode_wav(&samples)?;
-    info!("encoded WAV: {} bytes", wav_data.len());
-
     let config = build_transcription_config(&context.config, language);
-
-    let text = match context
-        .transcription_backend
-        .transcribe(&wav_data, &config)
-        .await
-    {
+    let result = if let Some(result) = background_result {
+        result
+    } else {
+        let wav_data = encode_wav(&samples)?;
+        info!("encoded WAV: {} bytes", wav_data.len());
+        context
+            .transcription_backend
+            .transcribe(&wav_data, &config)
+            .await
+    };
+    let text = match result {
         Ok(t) => t,
         Err(e) => {
             let friendly = format_api_error(&e);
@@ -3158,6 +3204,9 @@ async fn handle_cancel(
                 cancel.store(true, Ordering::SeqCst);
             }
             if let Some(task) = ds.streaming_task.take() {
+                task.abort();
+            }
+            if let Some(task) = ds.chunked_task.take() {
                 task.abort();
             }
             ds.recording_window_id = None;

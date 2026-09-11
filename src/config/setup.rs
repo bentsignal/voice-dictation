@@ -509,7 +509,11 @@ pub(crate) fn configure_backend(
                 .context("failed to read ASR sidecar model")?;
 
             Ok(BackendConfigSelection {
-                asr_sidecar: Some(AsrSidecarConfig { url, model }),
+                asr_sidecar: Some(AsrSidecarConfig {
+                    url,
+                    model,
+                    chunk_seconds: existing_sidecar.map_or(0, |c| c.chunk_seconds),
+                }),
                 ..BackendConfigSelection::default()
             })
         }

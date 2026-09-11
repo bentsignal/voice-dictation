@@ -117,6 +117,9 @@ model_path = "~/.local/share/whisrs/models/ggml-base.en.bin"
 [asr-sidecar]
 url = "http://127.0.0.1:8765/transcribe"
 model = "microsoft/VibeVoice-ASR-HF"
+# Optional background batches, with one final insertion after stopping.
+# 0 = disabled (default); otherwise 10–120 seconds. Try 30 for Parakeet.
+chunk_seconds = 0
 
 # Command mode: LLM for voice-driven text rewriting
 [llm]

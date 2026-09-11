@@ -518,6 +518,9 @@ pub struct LocalParakeetConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AsrSidecarConfig {
+    /// Background batch cap in seconds; 0 disables, otherwise 10–120.
+    #[serde(default)]
+    pub chunk_seconds: u64,
     #[serde(default = "default_asr_sidecar_url")]
     pub url: String,
     #[serde(default = "default_asr_sidecar_model")]
@@ -866,6 +869,15 @@ impl Config {
                 }
             }
             "asr-sidecar" | "asr" | "vibevoice" => {
+                if self
+                    .asr_sidecar
+                    .as_ref()
+                    .is_some_and(|c| c.chunk_seconds != 0 && !(10..=120).contains(&c.chunk_seconds))
+                {
+                    return Err(WhisrsError::Config(
+                        "asr-sidecar.chunk_seconds must be 0 or between 10 and 120".to_string(),
+                    ));
+                }
                 let url = self
                     .asr_sidecar
                     .as_ref()
@@ -1601,6 +1613,7 @@ mod tests {
             local_vosk: None,
             local_parakeet: None,
             asr_sidecar: Some(AsrSidecarConfig {
+                chunk_seconds: 0,
                 url: "http://127.0.0.1:8765/transcribe".to_string(),
                 model: "microsoft/VibeVoice-ASR-HF".to_string(),
             }),

@@ -1,6 +1,7 @@
 //! Transcription backends: trait definition and implementations.
 
 pub mod asr_sidecar;
+pub mod chunked_batch;
 pub mod deepgram;
 pub mod groq;
 pub mod local_parakeet;
