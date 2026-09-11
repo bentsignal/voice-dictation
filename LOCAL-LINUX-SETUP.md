@@ -54,3 +54,32 @@ curl http://127.0.0.1:8765/health
 The existing NixOS integration and its machine-specific notes remain in
 [`LOCAL-NIXOS-SETUP.md`](LOCAL-NIXOS-SETUP.md). It builds the same source tree
 through `flake-package.nix` and manages equivalent user services declaratively.
+
+## Background batches for long dictation
+
+Set `chunk_seconds = 30` in `[asr-sidecar]` in `~/.config/whisrs/config.toml`,
+then restart `whisrs.service` while idle. Dictation decodes in the background
+with requests of at most 30 seconds, choosing the quietest 100 ms in the last
+five seconds for each boundary. Short recordings still use one request. Text
+is joined in order and inserted once on stop using the existing output mode.
+Set the value to `0` and restart to restore whole-recording transcription.
+
+Requests run sequentially and time out after 120 seconds. On a request failure,
+no partial transcript is inserted; capture continues and the complete audio
+is saved by the existing recovery workflow when you stop. Cancellation drops
+the background work and inserts nothing. Audio stays local with the local URL.
+Raw PCM is still retained in memory for recovery (about 1.92 MB/minute, plus
+allocation overhead), but model inference receives only a bounded chunk.
+
+Chunk boundaries can change punctuation or recognition, especially without
+pauses. To compare the local recognizer with a 16 kHz mono PCM16 WAV:
+
+```console
+python3 scripts/benchmark-chunks.py sample.wav --seconds 90
+```
+
+The script reports durations and agreement between word sequences, not
+accuracy against a human transcript. `--repeat` fills the duration by repeating
+a short fixture. It sends requests only to `127.0.0.1:8765` and prints no text
+from the recording. Its final-chunk timing estimates remaining inference work
+when earlier chunks have finished; it excludes capture shutdown and insertion.
